@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/password_service.dir/src/main.cpp.o -o password_service  -lsodium 

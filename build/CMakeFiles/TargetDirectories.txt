@@ -1,3 +1,0 @@
-/home/udozer/password_service/build/CMakeFiles/password_service.dir
-/home/udozer/password_service/build/CMakeFiles/edit_cache.dir
-/home/udozer/password_service/build/CMakeFiles/rebuild_cache.dir

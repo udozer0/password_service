@@ -9,12 +9,23 @@
 #include <sstream>
 #include <ctime>
 
-#include "httplib.h"           // third_party/httplib.h
-#include "json.hpp"            // third_party/json.hpp
+#include "third_party/httplib.h"
+
+
 #include "metrics.hpp"         // наш модуль для StatsD → telegraf
+#include "graphql/PasswordGraphQL.h"
 
 #include <sodium.h>
+#include <graphqlservice/GraphQLService.h>
+#include <graphqlservice/GraphQLParse.h>      // если используешь парсер
+#include <graphqlservice/JSONResponse.h>     // для ответа
+#include "graphql/PasswordSchema.h"
 
+#include <nlohmann/json.hpp>
+
+std::shared_ptr<graphql::service::Request> make_graphql_password_service();
+
+using namespace graphql;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -23,7 +34,7 @@ namespace fs = std::filesystem;
   #include <unistd.h>
 #endif
 
-static constexpr const char* DB_FILE   = "data/vault.json";
+static constexpr const char* DB_FILE   = "/data/vault.json";
 static constexpr size_t SALT_LEN       = crypto_pwhash_SALTBYTES;
 static constexpr size_t KEY_LEN        = crypto_secretbox_KEYBYTES;
 static constexpr size_t NONCE_LEN      = crypto_secretbox_NONCEBYTES;
@@ -155,6 +166,7 @@ std::string generate_password(int length,
 
 
 int main() {
+
     if (sodium_init() < 0) {
         std::cerr << "sodium_init failed\n";
         return 1;
@@ -162,7 +174,6 @@ int main() {
 
     std::cout << "===== Simple Password Service (local) =====\n";
 
-    // 🔐 master password: env → fallback на stdin
     std::string master;
     if (const char* env_pw = std::getenv("MASTER_PASSWORD")) {
         master = env_pw;
@@ -202,37 +213,98 @@ int main() {
             std::cerr << "Error opening DB: " << e.what() << "\n";
             return 1;
         }
-    }
+    } 
+    using graphql::password::ServicePtr;
+
+    ServicePtr service = graphql::password::build_service();
 
     httplib::Server svr;
 
-    // health
+
+    auto serve_file = [](const std::string& path, const std::string& content_type) {
+        return [path, content_type](const httplib::Request&, httplib::Response& res) {
+            std::ifstream f(path, std::ios::binary);
+            if (!f) { res.status = 404; return; }
+            std::string body((std::istreambuf_iterator<char>(f)), {});
+            res.set_content(std::move(body), content_type);
+        };
+    };
+
+    svr.Get("/static/react.production.min.js",
+        serve_file("/src/web/react.production.min.js", "application/javascript; charset=utf-8"));
+    svr.Get("/static/react-dom.production.min.js",
+        serve_file("/src/web/react-dom.production.min.js", "application/javascript; charset=utf-8"));
+    svr.Get("/static/graphiql.min.js",
+        serve_file("/src/web/graphiql.min.js", "application/javascript; charset=utf-8"));
+    svr.Get("/static/graphiql.min.css",
+        serve_file("/src/web/graphiql.min.css", "text/css; charset=utf-8"));
+
+    svr.Get("/ui", [](const httplib::Request&, httplib::Response& res) {
+    res.set_content(R"HTML(
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8"/>
+            <title>GraphiQL</title>
+            <link rel="stylesheet" href="/static/graphiql.min.css" />
+            <style>html,body,#graphiql{height:100%;margin:0}</style>
+        </head>
+        <body>
+            <div id="graphiql"></div>
+            <script src="/static/react.production.min.js"></script>
+            <script src="/static/react-dom.production.min.js"></script>
+            <script src="/static/graphiql.min.js"></script>
+            <script>
+            const fetcher = GraphiQL.createFetcher({ url: '/graphql' });
+            ReactDOM.render(
+                React.createElement(GraphiQL, { fetcher }),
+                document.getElementById('graphiql')
+            );
+            </script>
+        </body>
+        </html>
+        )HTML", "text/html; charset=utf-8");
+    });
+
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.status = 302;
+        res.set_header("Location", "/ui");
+    });
+
+    svr.Post("/graphql",
+        [service](const httplib::Request& req, httplib::Response& res)
+        {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type");
+
+            nlohmann::json bodyJson;
+
+            try
+            {
+                bodyJson = nlohmann::json::parse(req.body);
+            }
+            catch (...)
+            {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid JSON"})", "application/json");
+                return;
+            }
+
+            std::string query      = bodyJson.value("query", std::string{});
+            std::string operation  = bodyJson.value("operationName", std::string{});
+            nlohmann::json varsJson = bodyJson.value("variables", nlohmann::json::object());
+
+            std::string resultJson =
+                graphql::password::execute_graphql(service, query, operation, varsJson);
+
+            res.status = 200;
+            res.set_content(resultJson, "application/json");
+        });
+        // health
     svr.Get("/health", with_metrics("/health",
         [](const Request&, Response& res) {
             res.status = 200;
             res.set_content("{\"status\":\"ok\"}", "application/json");
-        }));
-
-    // generate
-    svr.Post("/generate", with_metrics("/generate",
-        [](const Request& req, Response& res) {
-            try {
-                auto j = json::parse(req.body);
-                int length   = j.value("length", j.value("len", 20));
-                bool up      = j.value("upper",   true);
-                bool low     = j.value("lower",   true);
-                bool digits  = j.value("digits",  true);
-                bool symbols = j.value("symbols", false);
-
-                std::string pw = generate_password(length, up, low, digits, symbols);
-                json out;
-                out["password"] = pw;
-                res.status = 200;
-                res.set_content(out.dump(), "application/json");
-            } catch (std::exception &e) {
-                res.status = 400;
-                res.set_content(json{{"error", e.what()}}.dump(), "application/json");
-            }
         }));
 
     // add
